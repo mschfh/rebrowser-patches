@@ -1,21 +1,6 @@
---- a/src/cdp/Browser.ts	
-+++ b/src/cdp/Browser.ts	
-@@ -334,6 +334,11 @@
-     return await this.#defaultContext.newPage();
-   }
- 
-+  // rebrowser-patches: expose browser CDP session
-+  _connection(): Connection {
-+    return this.#connection;
-+  }
-+
-   async _createPageInContext(contextId?: string): Promise<Page> {
-     const {targetId} = await this.#connection.send('Target.createTarget', {
-       url: 'about:blank',
-
 --- a/src/cdp/ExecutionContext.ts	
 +++ b/src/cdp/ExecutionContext.ts	
-@@ -78,6 +78,7 @@
+@@ -86,6 +86,7 @@
    #client: CDPSession;
    #world: IsolatedWorld;
    #id: number;
@@ -23,7 +8,7 @@
    #name?: string;
  
    readonly #disposables = new DisposableStack();
-@@ -94,16 +95,22 @@
+@@ -105,16 +106,22 @@
      if (contextPayload.name) {
        this.#name = contextPayload.name;
      }
@@ -53,7 +38,7 @@
      clientEmitter.on('Runtime.consoleAPICalled', this.#onConsoleAPI.bind(this));
      clientEmitter.on(CDPSessionEvent.Disconnected, () => {
        this[disposeSymbol]();
-@@ -350,6 +357,186 @@
+@@ -369,6 +376,186 @@
      return await this.#evaluate(false, pageFunction, ...args);
    }
  
@@ -183,7 +168,7 @@
 +          }
 +        }
 +
-+        debugError(error);
++        this.#logger?.(DEBUG_PREFIXES.error)?.(error);
 +      }
 +    } else if (fixMode === 'alwaysIsolated') {
 +      if (this.#id === -3) {
@@ -240,7 +225,7 @@
    async #evaluate<
      Params extends unknown[],
      Func extends EvaluateFunc<Params> = EvaluateFunc<Params>,
-@@ -374,6 +561,13 @@
+@@ -393,6 +580,13 @@
      pageFunction: Func | string,
      ...args: Params
    ): Promise<HandleFor<Awaited<ReturnType<Func>>> | Awaited<ReturnType<Func>>> {
@@ -254,10 +239,9 @@
      const sourceUrlComment = getSourceUrlComment(
        getSourcePuppeteerURLIfAvailable(pageFunction)?.toString() ??
          PuppeteerURL.INTERNAL_URL,
-
 --- a/src/cdp/FrameManager.ts	
 +++ b/src/cdp/FrameManager.ts	
-@@ -191,6 +191,10 @@
+@@ -214,6 +214,10 @@
        this.#onFrameStoppedLoading(event.frameId);
      });
      session.on('Runtime.executionContextCreated', async event => {
@@ -268,7 +252,7 @@
        await this.#frameTreeHandled?.valueOrThrow();
        this.#onExecutionContextCreated(event.context, session);
      });
-@@ -216,9 +220,17 @@
+@@ -242,9 +246,17 @@
            this.#frameTreeHandled?.resolve();
          }),
          client.send('Page.setLifecycleEventsEnabled', {enabled: true}),
@@ -289,9 +273,9 @@
          ...(frame
            ? Array.from(this.#scriptsToEvaluateOnNewDocument.values())
            : []
-@@ -229,6 +241,30 @@
-           return frame?.addExposedFunctionBinding(binding);
+@@ -256,6 +268,31 @@
          }),
+         this.#page.browser().isIssuesEnabled() && client.send('Audits.enable'),
        ]);
 +
 +      // rebrowser-patches: manually create main world context
@@ -312,7 +296,8 @@
 +            frame.client,
 +            // @ts-ignore
 +            contextPayload,
-+            world
++            world,
++            this.#logger,
 +          );
 +          world.setContext(context);
 +        })
@@ -320,7 +305,7 @@
      } catch (error) {
        this.#frameTreeHandled?.resolve();
        // The target might have been closed before the initialization finished.
-@@ -455,6 +491,24 @@
+@@ -512,6 +549,24 @@
        this._frameTree.addFrame(frame);
      }
  
@@ -345,7 +330,7 @@
      frame = await this._frameTree.waitForFrame(frameId);
      frame._navigated(framePayload);
      this.emit(FrameManagerEvent.FrameNavigated, frame);
-@@ -487,6 +541,24 @@
+@@ -544,6 +599,24 @@
                worldName: name,
                grantUniveralAccess: true,
              })
@@ -367,10 +352,9 @@
 +                }
 +              }, frame.client)
 +            })
-             .catch(debugError);
-         }),
-     );
-
+             .catch(error => {
+               this.#logger?.(DEBUG_PREFIXES.error)?.(error);
+             });
 --- a/src/cdp/IsolatedWorld.ts	
 +++ b/src/cdp/IsolatedWorld.ts	
 @@ -1,3 +1,4 @@
@@ -378,7 +362,7 @@
  /**
   * @license
   * Copyright 2019 Google Inc.
-@@ -18,13 +19,14 @@
+@@ -20,11 +21,12 @@
    fromEmitterEvent,
    timeout,
    withSourcePuppeteerURLIfNone,
@@ -390,18 +374,15 @@
 -import type {ExecutionContext} from './ExecutionContext.js';
 +import {ExecutionContext} from './ExecutionContext.js';
  import type {CdpFrame} from './Frame.js';
--import type {MAIN_WORLD, PUPPETEER_WORLD} from './IsolatedWorlds.js';
-+import {MAIN_WORLD, PUPPETEER_WORLD} from './IsolatedWorlds.js';
- import {CdpJSHandle} from './JSHandle.js';
- import type {CdpWebWorker} from './WebWorker.js';
- 
-@@ -137,6 +139,23 @@
+ import type {PUPPETEER_WORLD} from './IsolatedWorlds.js';
+ import {MAIN_WORLD} from './IsolatedWorlds.js';
+@@ -147,6 +149,23 @@
     * Waits for the next context to be set on the isolated world.
     */
    async #waitForExecutionContext(): Promise<ExecutionContext> {
 +    const fixMode = process.env['REBROWSER_PATCHES_RUNTIME_FIX_MODE'] || 'addBinding';
 +    if (fixMode === 'addBinding') {
-+      const isMainWorld = this.#frameOrWorker.worlds[MAIN_WORLD] === this;
++      const isMainWorld = this.#worldId === MAIN_WORLD;
 +      process.env['REBROWSER_PATCHES_DEBUG'] && console.log(`[rebrowser-patches][waitForExecutionContext] frameId = ${this.#frameOrWorker._id}, isMainWorld = ${isMainWorld}`);
 +
 +      const contextPayload = {
@@ -411,15 +392,15 @@
 +          frameId: this.#frameOrWorker._id,
 +        }
 +      };
-+      const context = new ExecutionContext(this.client, contextPayload, this);
++      const context = new ExecutionContext(this.client, contextPayload, this, this.#logger);
 +      this.setContext(context);
 +      return context;
 +    }
-+    
++
      const error = new Error('Execution context was destroyed');
      const result = await firstValueFrom(
        fromEmitterEvent(this.#emitter, 'context').pipe(
-@@ -206,6 +225,8 @@
+@@ -216,6 +235,8 @@
      if (!context) {
        context = await this.#waitForExecutionContext();
      }
@@ -428,11 +409,10 @@
      const {object} = await this.client.send('DOM.resolveNode', {
        backendNodeId: backendNodeId,
        executionContextId: context.id,
-
 --- a/src/cdp/WebWorker.ts	
 +++ b/src/cdp/WebWorker.ts	
-@@ -58,6 +58,10 @@
-     this.#world = new IsolatedWorld(this, new TimeoutSettings());
+@@ -72,6 +72,10 @@
+     this.#emitter = new EventEmitter<WebWorkerEvents>(undefined, logger);
  
      this.#client.once('Runtime.executionContextCreated', async event => {
 +      if (process.env['REBROWSER_PATCHES_RUNTIME_FIX_MODE'] !== '0') {
@@ -440,13 +420,15 @@
 +        return
 +      }
        this.#world.setContext(
-         new ExecutionContext(client, event.context, this.#world),
+         new ExecutionContext(client, event.context, this.#world, logger),
        );
-@@ -82,7 +86,22 @@
- 
-     // This might fail if the target is closed before we receive all execution contexts.
-     networkManager?.addClient(this.#client).catch(debugError);
--    this.#client.send('Runtime.enable').catch(debugError);
+@@ -120,9 +124,24 @@
+     networkManager?.addClient(this.#client).catch((err: Error) => {
+       return this.#logger?.(DEBUG_PREFIXES.error)?.(err);
+     });
+-    this.#client.send('Runtime.enable').catch((err: Error) => {
+-      return this.#logger?.(DEBUG_PREFIXES.error)?.(err);
+-    });
 +    if (process.env['REBROWSER_PATCHES_RUNTIME_FIX_MODE'] !== '0') {
 +      // @ts-ignore
 +      process.env['REBROWSER_PATCHES_DEBUG'] && console.log('[rebrowser-patches][WebWorker] initialize', targetType, targetId, client._target(), client._target()._getTargetInfo())
@@ -459,17 +441,18 @@
 +        }
 +      }
 +      // @ts-ignore
-+      this.#world.setContext(new ExecutionContext(client, contextPayload, this.#world));
++      this.#world.setContext(new ExecutionContext(client, contextPayload, this.#world, logger));
 +    } else {
-+      this.#client.send('Runtime.enable').catch(debugError);
++      this.#client.send('Runtime.enable').catch((err: Error) => {
++        return this.#logger?.(DEBUG_PREFIXES.error)?.(err);
++      });
 +    }
    }
  
    mainRealm(): Realm {
-
 --- a/src/common/util.ts	
 +++ b/src/common/util.ts	
-@@ -299,7 +299,9 @@
+@@ -292,7 +292,9 @@
   * @internal
   */
  export const UTILITY_WORLD_NAME =
@@ -480,7 +463,7 @@
  
  /**
   * @internal
-@@ -310,6 +312,10 @@
+@@ -303,6 +305,10 @@
   * @internal
   */
  export function getSourceUrlComment(url: string): string {
