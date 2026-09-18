@@ -100,6 +100,8 @@ This patch adds a new method `_connection()` to Browser class, so you can use it
 ```js
 browser._connection().on('Rebrowser.addRunEvent', (params) => { ... })
 ```
+On Puppeteer 25+, the library already exposes `browser._connection` as a getter, so this patch is not applied there. Use `browser._connection.on(...)` (property access, no extra `()`).
+
 *Note: it's not detectable by external website scripts, it's just for your convenience.*
 
 ### Change default utility world name
@@ -148,7 +150,7 @@ If you already have your package patched and want to update to the latest versio
 All these versions are just wrappers around Node.js version of Playwright. You need to find `driver` folder inside your Playwright package and run this patch with `--packagePath=$yourDriverFolder/$yourPlatform/package`.
 
 ## Puppeteer support
-✅ Latest fully tested version: 24.8.1 (released 2025-05-06)
+✅ Latest fully tested version: 25.11.0 (released 2026-09-13)
 
 ## Playwright support
 Playwright patches include:

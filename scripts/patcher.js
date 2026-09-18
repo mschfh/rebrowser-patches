@@ -97,7 +97,10 @@ import {
   } catch (e) {
     if (e.stdout.includes('No file to patch')) {
       fatalError('Internal error, patch command cannot find file to patch')
-    } else if (e.stdout.includes('Ignoring previously applied (or reversed) patch')) {
+    } else if (
+      e.stdout.includes('Ignoring previously applied (or reversed) patch') ||
+      e.stdout.includes('Reversed (or previously applied) patch detected')
+    ) {
       patchStatus = 'patched'
     } else if (e.stderr.includes('is not recognized')) {
       let message = 'patch command not found!'
