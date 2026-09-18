@@ -1,7 +1,6 @@
-
---- a/src/server/chromium/crConnection.ts	
-+++ b/src/server/chromium/crConnection.ts	
-@@ -201,6 +201,153 @@
+--- a/src/server/chromium/crConnection.ts
++++ b/src/server/chromium/crConnection.ts
+@@ -200,6 +200,159 @@ export class CRSession extends SdkObject<Protocol.EventMap & ConnectionEventMap>
      }
      this._callbacks.clear();
    }
@@ -9,10 +8,16 @@
 +  async __re__emitExecutionContext({
 +    world,
 +    targetId,
-+    frame = null
++    frame = null,
++    playwrightUtilityWorldName = undefined,
 +  }) {
 +    const fixMode = process.env['REBROWSER_PATCHES_RUNTIME_FIX_MODE'] || 'addBinding'
-+    const utilityWorldName = process.env['REBROWSER_PATCHES_UTILITY_WORLD_NAME'] !== '0' ? (process.env['REBROWSER_PATCHES_UTILITY_WORLD_NAME'] || 'util') : '__playwright_utility_world__';
++    const envUtilityWorldName = process.env['REBROWSER_PATCHES_UTILITY_WORLD_NAME']
++    // Playwright 1.63+ registers utility only if payload.name === crPage.utilityWorldName
++    // (`__playwright_utility_world_${page.guid}`). Hide still uses env/`util` for CDP;
++    // REBROWSER_PATCHES_UTILITY_WORLD_NAME=0 uses Playwright's live per-page default.
++    const playwrightUtilityName = playwrightUtilityWorldName || '__playwright_utility_world__'
++    const utilityWorldName = envUtilityWorldName !== '0' ? (envUtilityWorldName || 'util') : playwrightUtilityName
 +    process.env['REBROWSER_PATCHES_DEBUG'] && console.log(`[rebrowser-patches][crSession] targetId = ${targetId}, world = ${world}, frame = ${frame ? 'Y' : 'N'}, fixMode = ${fixMode}`)
 +
 +    let getWorldPromise
@@ -26,8 +31,8 @@
 +          .then((contextId) => {
 +            return {
 +              id: contextId,
-+              // use UTILITY_WORLD_NAME value from crPage.ts otherwise _onExecutionContextCreated will ignore it
-+              name: '__playwright_utility_world__',
++              // use crPage.utilityWorldName otherwise _onExecutionContextCreated will ignore it
++              name: playwrightUtilityName,
 +              auxData: {
 +                frameId: targetId,
 +                isDefault: false
@@ -154,11 +159,10 @@
 +  }
  }
  
- export class CDPSession extends EventEmitter {
-
---- a/src/server/chromium/crDevTools.ts	
-+++ b/src/server/chromium/crDevTools.ts	
-@@ -67,7 +67,11 @@
+ export class CDPSession extends SdkObject {
+--- a/src/server/chromium/crDevTools.ts
++++ b/src/server/chromium/crDevTools.ts
+@@ -64,7 +64,11 @@ export class CRDevTools {
        }).catch(e => null);
      });
      Promise.all([
@@ -171,158 +175,155 @@
        session.send('Runtime.addBinding', { name: kBindingName }),
        session.send('Page.enable'),
        session.send('Page.addScriptToEvaluateOnNewDocument', { source: `
-
---- a/src/server/chromium/crPage.ts	
-+++ b/src/server/chromium/crPage.ts	
-@@ -507,7 +507,11 @@
+--- a/src/server/chromium/crPage.ts
++++ b/src/server/chromium/crPage.ts
+@@ -531,7 +531,12 @@ class FrameSession {
        }),
        this._client.send('Log.enable', {}),
        lifecycleEventsEnabled = this._client.send('Page.setLifecycleEventsEnabled', { enabled: true }),
 -      this._client.send('Runtime.enable', {}),
 +      (() => {
-+        if (process.env['REBROWSER_PATCHES_RUNTIME_FIX_MODE'] === '0') {
-+          return this._client.send('Runtime.enable', {})
-+        }
++        // rebrowser-patches: skip Runtime.enable
++        if (process.env['REBROWSER_PATCHES_RUNTIME_FIX_MODE'] === '0')
++          return this._client.send('Runtime.enable', {});
++        return undefined;
 +      })(),
-       this._client.send('Runtime.addBinding', { name: PageBinding.kPlaywrightBinding }),
        this._client.send('Page.addScriptToEvaluateOnNewDocument', {
          source: '',
-@@ -719,14 +723,17 @@
+         worldName: this._crPage.utilityWorldName,
+@@ -772,7 +777,8 @@ class FrameSession {
      }
  
      const url = event.targetInfo.url;
 -    const worker = new Worker(this._page, url);
-+    const worker = new Worker(this._page, url, event.targetInfo.targetId, session);
-     this._page._addWorker(event.sessionId, worker);
++    // rebrowser-patches: pass targetId and session to Worker for manual context acquisition
++    const worker = new Worker(this._page, url, undefined, event.targetInfo.targetId, session);
+     this._page.addWorker(event.sessionId, worker);
      this._workerSessions.set(event.sessionId, session);
      session.once('Runtime.executionContextCreated', async event => {
-       worker._createExecutionContext(new CRExecutionContext(session, event.context));
-     });
+@@ -782,8 +788,10 @@ class FrameSession {
+       session.on('Inspector.workerScriptLoaded', () => worker.workerScriptLoaded());
+     else
+       worker.workerScriptLoaded();
 -    // This might fail if the target is closed before we initialize.
 -    session._sendMayFail('Runtime.enable');
 +    if (process.env['REBROWSER_PATCHES_RUNTIME_FIX_MODE'] === '0') {
 +      // This might fail if the target is closed before we initialize.
 +      session._sendMayFail('Runtime.enable');
 +    }
-+
-     // TODO: attribute workers to the right frame.
-     this._crPage._networkManager.addSession(session, this._page._frameManager.frame(this._targetId) ?? undefined).catch(() => {});
+     this._crPage._networkManager.addSession(session, this._page.frameManager.frame(event.targetInfo.parentFrameId ?? this._targetId) ?? undefined).catch(() => {});
      session._sendMayFail('Runtime.runIfWaitingForDebugger');
-
---- a/src/server/chromium/crServiceWorker.ts	
-+++ b/src/server/chromium/crServiceWorker.ts	
-@@ -45,7 +45,9 @@
-       this._networkManager.addSession(session, undefined, true /* isMain */).catch(() => {});
-     }
+     session._sendMayFail('Target.setAutoAttach', { autoAttach: true, waitForDebuggerOnStart: true, flatten: true });
+--- a/src/server/chromium/crServiceWorker.ts
++++ b/src/server/chromium/crServiceWorker.ts
+@@ -66,7 +66,8 @@ export class CRServiceWorker extends Worker {
+       this.browserContext.emit(BrowserContext.Events.Console, message);
+     });
  
--    session.send('Runtime.enable', {}).catch(e => { });
-+    if (process.env['REBROWSER_PATCHES_RUNTIME_FIX_MODE'] === '0') {
-+      session.send('Runtime.enable', {}).catch(e => { });
-+    }
-     session.send('Runtime.runIfWaitingForDebugger').catch(e => { });
+-    session.send('Runtime.enable', {}).catch(e => {});
++    if (process.env['REBROWSER_PATCHES_RUNTIME_FIX_MODE'] === '0')
++      session.send('Runtime.enable', {}).catch(e => {});
+     session.send('Runtime.runIfWaitingForDebugger').catch(e => {});
      session.on('Inspector.targetReloadedAfterCrash', () => {
        // Resume service worker after restart.
-
---- a/src/server/frames.ts	
-+++ b/src/server/frames.ts	
-@@ -540,6 +540,8 @@
+--- a/src/server/frames.ts
++++ b/src/server/frames.ts
+@@ -580,6 +580,9 @@ export class Frame extends SdkObject<FrameEventMap> {
        this._startNetworkIdleTimer();
      this._page.mainFrame()._recalculateNetworkIdle(this);
-     this._onLifecycleEvent('commit');
-+    const crSession = (this._page._delegate._sessions.get(this._id) || this._page._delegate._mainFrameSession)._client
-+    crSession.emit('Runtime.executionContextsCleared')
+     this.onLifecycleEvent('commit');
++    // rebrowser-patches: reset execution contexts on navigation commit
++    const crSession = (((this._page.delegate as any)._sessions?.get(this._id)) || (this._page.delegate as any)._mainFrameSession)?._client;
++    crSession?.emit('Runtime.executionContextsCleared');
    }
  
-   setPendingDocument(documentInfo: DocumentInfo | undefined) {
-@@ -743,12 +745,34 @@
-     return this._page._delegate.getFrameElement(this);
+   _setPendingDocument(documentInfo: DocumentInfo | undefined) {
+@@ -784,13 +787,33 @@ export class Frame extends SdkObject<FrameEventMap> {
+     return await progress.race(this._page.delegate.getFrameElement(this));
    }
  
--  _context(world: types.World): Promise<dom.FrameExecutionContext> {
+-  context(world: types.World): Promise<dom.FrameExecutionContext> {
++  context(world: types.World, useContextPromise = false): Promise<dom.FrameExecutionContext> {
+     if (this._page.delegate.noUtilityWorld?.())
+       world = 'main';
 -    return this._contextData.get(world)!.contextPromise.then(contextOrDestroyedReason => {
 -      if (contextOrDestroyedReason instanceof js.ExecutionContext)
 -        return contextOrDestroyedReason;
 -      throw new Error(contextOrDestroyedReason.destroyedReason);
--    });
-+  _context(world: types.World, useContextPromise = false): Promise<dom.FrameExecutionContext> {
-+    if (process.env['REBROWSER_PATCHES_RUNTIME_FIX_MODE'] === '0' || this._contextData.get(world).context || useContextPromise) {
++    // rebrowser-patches: acquire context lazily instead of relying on Runtime.enable
++    if (process.env['REBROWSER_PATCHES_RUNTIME_FIX_MODE'] === '0' || this._contextData.get(world)!.context || useContextPromise) {
 +      return this._contextData.get(world)!.contextPromise.then(contextOrDestroyedReason => {
 +        if (contextOrDestroyedReason instanceof js.ExecutionContext)
 +          return contextOrDestroyedReason;
 +        throw new Error(contextOrDestroyedReason.destroyedReason);
 +      });
 +    }
-+
-+    const crSession = (this._page._delegate._sessions.get(this._id) || this._page._delegate._mainFrameSession)._client
++    const crSession = (((this._page.delegate as any)._sessions?.get(this._id)) || (this._page.delegate as any)._mainFrameSession)._client;
 +    return crSession.__re__emitExecutionContext({
 +      world,
 +      targetId: this._id,
-+      frame: this
-+    })
-+      .then(() => {
-+        return this._context(world, true)
-+      })
-+      .catch(error => {
-+        if (error.message.includes('No frame for given id found')) {
-+          // ignore, frame is already gone
-+          return {
-+            destroyedReason: 'Frame was detached'
-+          }
-+        }
-+        debugLogger.log('error', error)
-+        console.error('[rebrowser-patches][frames._context] cannot get world, error:', error)
-+      })
++      frame: this,
++      playwrightUtilityWorldName: (this._page.delegate as any).utilityWorldName,
++    }).then(() => {
++      return this.context(world, true);
++    }).catch((error: any) => {
++      if (error.message.includes('No frame for given id found')) {
++        // ignore, frame is already gone
++        return { destroyedReason: 'Frame was detached' } as any;
++      }
++      // eslint-disable-next-line no-console
++      console.error('[rebrowser-patches][frames.context] cannot get world, error:', error);
++      throw error;
+     });
    }
  
-   _mainContext(): Promise<dom.FrameExecutionContext> {
-
---- a/src/server/page.ts	
-+++ b/src/server/page.ts	
-@@ -823,12 +823,16 @@
-   private _executionContextCallback: (value: js.ExecutionContext) => void;
-   _existingExecutionContext: js.ExecutionContext | null = null;
+--- a/src/server/page.ts
++++ b/src/server/page.ts
+@@ -995,12 +995,28 @@ export class Worker extends SdkObject<WorkerEventMap> {
+   existingExecutionContext: js.ExecutionContext | null = null;
    readonly openScope = new LongStandingScope();
-+  private _targetId: string;
+   _closeReason: string | undefined;
++  // rebrowser-patches: keep targetId/session to acquire main-world context lazily
++  private _targetId: string | undefined;
 +  private _session: any;
  
--  constructor(parent: SdkObject, url: string) {
-+  constructor(parent: SdkObject, url: string, targetId: string, session: any) {
+-  constructor(parent: SdkObject, url: string, onDisconnect?: () => Promise<void>) {
++  constructor(parent: SdkObject, url: string, onDisconnect?: () => Promise<void>, targetId?: string, session?: any) {
      super(parent, 'worker');
-     this._url = url;
-     this._executionContextCallback = () => {};
-     this._executionContextPromise = new Promise(x => this._executionContextCallback = x);
-+    this._targetId = targetId
-+    this._session = session
-   }
- 
-   _createExecutionContext(delegate: js.ExecutionContextDelegate) {
-@@ -848,12 +852,23 @@
-     this.openScope.close(new Error('Worker closed'));
-   }
- 
+     this.attribution.worker = this;
+     this.url = url;
+     this._onDisconnect = onDisconnect;
++    this._targetId = targetId;
++    this._session = session;
++  }
++
++  // rebrowser-patches: manually acquire the worker main-world context when Runtime.enable is skipped
 +  async getExecutionContext() {
-+    if (process.env['REBROWSER_PATCHES_RUNTIME_FIX_MODE'] !== '0' && !this._existingExecutionContext) {
++    if (process.env['REBROWSER_PATCHES_RUNTIME_FIX_MODE'] !== '0' && !this.existingExecutionContext && this._session) {
 +      await this._session.__re__emitExecutionContext({
 +        world: 'main',
 +        targetId: this._targetId,
-+      })
++      });
 +    }
-+
-+    return this._executionContextPromise
-+  }
-+
-   async evaluateExpression(expression: string, isFunction: boolean | undefined, arg: any): Promise<any> {
--    return js.evaluateExpression(await this._executionContextPromise, expression, { returnByValue: true, isFunction }, arg);
-+    return js.evaluateExpression(await this.getExecutionContext(), expression, { returnByValue: true, isFunction }, arg);
++    return this._executionContextPromise;
    }
  
-   async evaluateExpressionHandle(expression: string, isFunction: boolean | undefined, arg: any): Promise<any> {
--    return js.evaluateExpression(await this._executionContextPromise, expression, { returnByValue: false, isFunction }, arg);
-+    return js.evaluateExpression(await this.getExecutionContext(), expression, { returnByValue: false, isFunction }, arg);
+   createExecutionContext(delegate: js.ExecutionContextDelegate) {
+@@ -1032,11 +1048,11 @@ export class Worker extends SdkObject<WorkerEventMap> {
    }
- }
  
-@@ -875,6 +890,10 @@
+   async evaluateExpression(progress: Progress, expression: string, isFunction: boolean | undefined, arg: any): Promise<any> {
+-    return progress.race(js.evaluateExpression(await this._executionContextPromise, expression, { returnByValue: true, isFunction }, arg));
++    return progress.race(js.evaluateExpression(await this.getExecutionContext(), expression, { returnByValue: true, isFunction }, arg));
+   }
+ 
+   async evaluateExpressionHandle(progress: Progress, expression: string, isFunction: boolean | undefined, arg: any): Promise<any> {
+-    return progress.race(js.evaluateExpression(await this._executionContextPromise, expression, { returnByValue: false, isFunction }, arg));
++    return progress.race(js.evaluateExpression(await this.getExecutionContext(), expression, { returnByValue: false, isFunction }, arg));
+   }
+ 
+   async disconnect(progress: Progress, options: { reason?: string } = {}) {
+@@ -1077,6 +1093,10 @@ export class PageBinding extends DisposableObject {
    }
  
    static async dispatch(page: Page, payload: string, context: dom.FrameExecutionContext) {
